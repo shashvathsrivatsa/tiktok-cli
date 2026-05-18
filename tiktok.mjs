@@ -2,6 +2,7 @@ import { launch, page, download } from './utils.mjs';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 
 const WATCH_HISTORY_PATH = 'watchHistory.json';
+const WATCH_BUFFER_PATH = 'watchHistoryBuffer.json';
 
 // ─── Watch history ────────────────────────────────────────────────────────────
 
@@ -13,25 +14,45 @@ function writeHistory(history) {
     writeFileSync(WATCH_HISTORY_PATH, JSON.stringify(history, null, 2));
 }
 
+function readBuffer() {
+    return existsSync(WATCH_BUFFER_PATH) ? JSON.parse(readFileSync(WATCH_BUFFER_PATH, 'utf8')) : [];
+}
+
+function writeBuffer(buf) {
+    writeFileSync(WATCH_BUFFER_PATH, JSON.stringify(buf, null, 2));
+}
+
 function setPlaytime(id, playtime) {
+    const buf = readBuffer();
+    const bufItem = buf.find(v => v.id === id);
+    if (bufItem) { bufItem.playtime = playtime; bufItem.playtime_max = Math.max(bufItem.playtime_max, playtime); writeBuffer(buf); return; }
     const h = readHistory();
     const item = h.find(v => v.id === id);
     if (item) { item.playtime = playtime; item.playtime_max = Math.max(item.playtime_max, playtime); writeHistory(h); }
 }
 
 function setFinished(id, value) {
+    const buf = readBuffer();
+    const bufItem = buf.find(v => v.id === id);
+    if (bufItem) { bufItem.is_finished = value; writeBuffer(buf); return; }
     const h = readHistory();
     const item = h.find(v => v.id === id);
     if (item) { item.is_finished = value; writeHistory(h); }
 }
 
 function setLiked(id, value) {
+    const buf = readBuffer();
+    const bufItem = buf.find(v => v.id === id);
+    if (bufItem) { bufItem.is_liked = value; writeBuffer(buf); return; }
     const h = readHistory();
     const item = h.find(v => v.id === id);
     if (item) { item.is_liked = value; writeHistory(h); }
 }
 
 function setSkipped(id, value) {
+    const buf = readBuffer();
+    const bufItem = buf.find(v => v.id === id);
+    if (bufItem) { bufItem.is_skipped = value; writeBuffer(buf); return; }
     const h = readHistory();
     const item = h.find(v => v.id === id);
     if (item) { item.is_skipped = value; writeHistory(h); }
@@ -41,7 +62,7 @@ function setSkipped(id, value) {
 
 // ─── FYP API call ─────────────────────────────────────────────────────────────
 
-async function fetchItemList(pullType, sessionVNum) {
+async function fetchItemList(pullType, sessionVNum, consumptionItems) {
     const count = pullType === 1 ? 6 : 12;
 
     const data = await page.evaluate(
@@ -125,7 +146,7 @@ async function fetchItemList(pullType, sessionVNum) {
             if (!res.ok) return { error: res.status };
             return res.json();
         },
-        { watchHistory: readHistory(), pullType, count, sessionVNum }
+        { watchHistory: consumptionItems, pullType, count, sessionVNum }
     );
 
     return data;
@@ -133,21 +154,26 @@ async function fetchItemList(pullType, sessionVNum) {
 
 
 
-// ─── FYP feed generator ───────────────────────────────────────────────────────
+// ─── Shared fetch loop ────────────────────────────────────────────────────────
 
-export async function fyp(count = 5, outputDir = 'vids', onFirstVideo = null) {
-    await launch();
-
-    let sessionVNum = 0;
-    let pullType = 1;
-    let batches = 0;
+async function fetchVideos(count, outputDir, { pullType = 2, onFirst = null } = {}) {
+    const startIndex = readHistory().length;
+    let sessionVNum = startIndex;
     let downloaded = 0;
+    let currentPullType = pullType;
+    let batches = 0;
+
+    // Flush buffer into watchHistory, then reset buffer for the new batch
+    const consumptionItems = readBuffer();
+    const archived = readHistory();
+    writeHistory([...archived, ...consumptionItems]);
+    writeBuffer([]);
 
     while (downloaded < count) {
-        const batchCount = pullType === 1 ? 6 : 12;
-        console.error(`[api] item_list pullType=${pullType} count=${batchCount} batch=${batches}`);
+        const batchCount = currentPullType === 1 ? 6 : 12;
+        console.error(`[api] item_list pullType=${currentPullType} count=${batchCount} batch=${batches}`);
 
-        const data = await fetchItemList(pullType, sessionVNum);
+        const data = await fetchItemList(currentPullType, sessionVNum, consumptionItems);
 
         if (data.error) throw new Error(`item_list HTTP ${data.error}`);
         if (data.status_code !== undefined && data.status_code !== 0) {
@@ -173,10 +199,11 @@ export async function fyp(count = 5, outputDir = 'vids', onFirstVideo = null) {
                 video.bitrateInfo?.find(b => b.CodecType === 'h264' && b.GearName?.startsWith('normal')) ??
                 video.bitrateInfo?.[0];
             const downloadUrl = bestBitrate?.PlayAddr?.UrlList?.[0] ?? video.playAddr;
+            if (!downloadUrl) { console.error('[api] no download URL for', item.id, '— skipping'); continue; }
 
             sessionVNum++;
-            const h = readHistory();
-            h.push({
+
+            const entry = {
                 id: item.id,
                 author_id: item.author?.id ?? '',
                 model_type: 0,
@@ -186,14 +213,14 @@ export async function fyp(count = 5, outputDir = 'vids', onFirstVideo = null) {
                 is_ad: !!item.isAd,
                 is_ecom: false,
                 page_tag: 'homepage_hot',
-                is_launch: h.length === 0,
+                is_launch: startIndex === 0 && downloaded === 0,
                 is_bytevc1: video.codecType?.includes('265') ?? false,
                 video_resolution: `${video.width}*${video.height}`,
                 start_playing_timestamp: Date.now(),
-                playtime: (video.duration ?? 0) * 1000,
-                playtime_max: (video.duration ?? 0) * 1000,
+                playtime: 0,
+                playtime_max: 0,
                 playtime_live: -1,
-                is_finished: true,
+                is_finished: false,
                 first_frame_duration: 100,
                 block_count: 0,
                 block_duration: 0,
@@ -208,23 +235,40 @@ export async function fyp(count = 5, outputDir = 'vids', onFirstVideo = null) {
                 is_commentted: false,
                 is_click_cover: false,
                 is_click_comment: false,
-            });
-            writeHistory(h);
+            };
 
-            const filename = `${outputDir}/${downloaded + 1}. ${item.id}.mp4`;
-            console.log(`[${downloaded + 1}/${count}] @${author} — ${desc.slice(0, 60)}`);
+            const buf = readBuffer();
+            buf.push(entry);
+            writeBuffer(buf);
+
+            const fileIndex = startIndex + downloaded + 1;
+            const filename = `${outputDir}/${fileIndex}_${item.id}.mp4`;
+            console.log(`[${fileIndex}] @${author} — ${desc.slice(0, 60)}`);
             console.log(`       ${video.width}x${video.height} ${video.codecType} ${Math.round((video.bitrate ?? 0) / 1000)}kbps`);
             console.log(`       → ${filename}`);
             await download(downloadUrl, filename);
             console.log(`       ✓ saved`);
 
-            if (downloaded === 0 && onFirstVideo) onFirstVideo(filename);
+            if (downloaded === 0 && onFirst) onFirst(filename);
             downloaded++;
         }
 
-        pullType = 2;
+        currentPullType = 2;
         batches++;
     }
+}
+
+
+
+// ─── Exports ──────────────────────────────────────────────────────────────────
+
+export async function fyp(count = 5, outputDir = 'vids', onFirstVideo = null) {
+    await launch();
+    await fetchVideos(count, outputDir, { pullType: 1, onFirst: onFirstVideo });
+}
+
+export async function fetchMore(count = 10, outputDir = 'vids') {
+    await fetchVideos(count, outputDir, { pullType: 2 });
 }
 
 export { setPlaytime, setFinished, setLiked, setSkipped };
